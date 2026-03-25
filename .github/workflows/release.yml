@@ -31,7 +31,13 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".TrimStart('v')
-          $zipName = "Garuda Debloat V$version.zip"
+          $parts = $version.Split('.')
+          if ($parts.Length -ge 2) {
+            $label = "$($parts[0]).$($parts[1])"
+          } else {
+            $label = $version
+          }
+          $zipName = "Garuda Debloat V$label.zip"
           Compress-Archive -Path "release/win-x64/*" -DestinationPath "release/$zipName" -Force
           Get-FileHash "release/$zipName" -Algorithm SHA256 | ForEach-Object {
             "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf)
