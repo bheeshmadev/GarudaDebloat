@@ -37,7 +37,7 @@ jobs:
           } else {
             $label = $version
           }
-          $zipName = "Garuda Debloat V$label.zip"
+          $zipName = "GarudaDebloat V$label.zip"
           Compress-Archive -Path "release/win-x64/*" -DestinationPath "release/$zipName" -Force
           Get-FileHash "release/$zipName" -Algorithm SHA256 | ForEach-Object {
             "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf)
