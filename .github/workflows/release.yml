@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore
+        run: dotnet restore GarudaDebloat.csproj
+
+      - name: Publish self-contained
+        run: dotnet publish GarudaDebloat.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true /p:PublishTrimmed=false -o release/win-x64
+
+      - name: Archive release files
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          $zipName = "GarudaDebloat-$version-win-x64-selfcontained.zip"
+          Compress-Archive -Path "release/win-x64/*" -DestinationPath "release/$zipName" -Force
+          Get-FileHash "release/$zipName" -Algorithm SHA256 | ForEach-Object {
+            "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf)
+          } | Set-Content "release/$zipName.sha256"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.zip
+            release/*.sha256
+          generate_release_notes: true
+          draft: false
+          prerelease: false
