@@ -4,7 +4,6 @@ GarudaDebloat is a portable Windows debloater utility built with C# WinForms on 
 
 Created by **Garuda Vault Security Research**.
 
-- Brand: Garuda Vault Security Research
 - Author/GitHub: bheeshmadev
 - Website: bheeshma.me
 - Version: 1.0.0
