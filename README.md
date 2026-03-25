@@ -20,15 +20,6 @@ The tool provides bulk selection, uninstall/removal workflow with confirmation, 
 
 On first launch, the tool shows a mandatory safety acknowledgment about irreversible removal risk.
 
-## Security-Oriented UX
-
-- Professional dark UI tuned for operational use
-- Red accent action styling for high-impact operations
-- Per-category tabs with focused search
-- DataGridView-based package tables with checkbox selection
-- Dedicated live Log tab with success/error colorization
-- Status bar showing visible/selected item counts and current operation
-
 ## Removal Behavior
 
 ### Win32 apps
