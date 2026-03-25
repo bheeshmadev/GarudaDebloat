@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
@@ -13,11 +13,8 @@ internal sealed class UninstallEngine
     internal sealed class UninstallResult
     {
         public int Total { get; init; }
-
         public int Succeeded { get; set; }
-
         public int Failed { get; set; }
-
         public bool FeatureDisabled { get; set; }
     }
 
@@ -31,7 +28,6 @@ internal sealed class UninstallEngine
         foreach (PackageEntry item in selectedItems)
         {
             cancellationToken.ThrowIfCancellationRequested();
-
             progress.Report(new LogMessage($"[INFO] Processing {item.TypeBadge}: {item.Name}", false));
 
             bool success;
@@ -49,8 +45,6 @@ internal sealed class UninstallEngine
             catch (Exception ex)
             {
                 progress.Report(new LogMessage($"[ERROR] {item.Name} failed with exception: {ex.Message}", true));
-                            List<(string Exe, string Args, string Label)> attempts = new();
-
                 success = false;
             }
 
@@ -80,57 +74,55 @@ internal sealed class UninstallEngine
             return false;
         }
 
+        List<(string Exe, string Args, string Label)> attempts = new();
+
         if (TryBuildMsiCommand(uninstallString, out string msiExe, out string msiArgs))
         {
-            int code = await RunProcessAsync(msiExe, msiArgs, ct);
-            if (code == 0)
-            {
-                CleanupResidualFiles(item, progress);
-                progress.Report(new LogMessage($"[OK] {item.Name} removed via MSI.", false));
-                return true;
-            }
-
-            progress.Report(new LogMessage($"[ERROR] {item.Name}: MSI uninstall exit code {code}.", true));
-            return false;
+            attempts.Add((msiExe, msiArgs, "MSI normalized"));
         }
 
         if (!string.IsNullOrWhiteSpace(item.QuietUninstallString) && TryParseCommand(item.QuietUninstallString, out string quietExe, out string quietArgs))
         {
-            int quietCode = await RunProcessAsync(quietExe, quietArgs, ct);
-            if (quietCode == 0)
-            {
-                CleanupResidualFiles(item, progress);
-                progress.Report(new LogMessage($"[OK] {item.Name} removed using QuietUninstallString.", false));
-                return true;
-            }
-
-            progress.Report(new LogMessage($"[WARN] {item.Name}: quiet uninstall failed with code {quietCode}, trying fallback.", true));
+            attempts.Add((quietExe, quietArgs, "QuietUninstallString"));
         }
 
-        if (!TryParseCommand(uninstallString, out string exe, out string args))
+        if (TryParseCommand(uninstallString, out string exe, out string args))
+        {
+            attempts.Add((exe, args, "UninstallString"));
+
+            string[] silentFlags = ["/S", "/quiet", "/qn", "/silent", "/VERYSILENT", "/s", "/passive"];
+            foreach (string flag in silentFlags)
+            {
+                attempts.Add((exe, EnsureFlag(args, flag), $"UninstallString + {flag}"));
+            }
+
+            if (exe.EndsWith("OneDriveSetup.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                attempts.Add((exe, "/uninstall", "OneDrive targeted"));
+                attempts.Add((exe, "/uninstall /allusers", "OneDrive targeted all users"));
+            }
+        }
+        else
         {
             progress.Report(new LogMessage($"[ERROR] {item.Name}: invalid uninstall command.", true));
             return false;
         }
 
-        string[] silentFlags =
-        [
-            "/S",
-            "/quiet"
-        ];
-
-        foreach (string flag in silentFlags)
+        foreach ((string attemptExe, string attemptArgs, string label) in attempts
+                     .GroupBy(x => $"{x.Exe}|{x.Args}", StringComparer.OrdinalIgnoreCase)
+                     .Select(x => x.First()))
         {
-            string trialArgs = EnsureFlag(args, flag);
-            int code = await RunProcessAsync(exe, trialArgs, ct);
-            if (code == 0)
+            progress.Report(new LogMessage($"[INFO] {item.Name}: trying {label}.", false));
+            ProcessResult result = await RunProcessDetailedAsync(attemptExe, attemptArgs, ct);
+            if (IsSuccessfulUninstallExitCode(result.ExitCode))
             {
                 CleanupResidualFiles(item, progress);
-                progress.Report(new LogMessage($"[OK] {item.Name} removed with flag {flag}.", false));
+                progress.Report(new LogMessage($"[OK] {item.Name} removed using {label}.", false));
                 return true;
             }
 
-            progress.Report(new LogMessage($"[WARN] {item.Name}: uninstall with {flag} returned {code}.", true));
+            string details = BuildProcessErrorDetails(result);
+            progress.Report(new LogMessage($"[WARN] {item.Name}: {label} failed with code {result.ExitCode}.{details}", true));
         }
 
         progress.Report(new LogMessage($"[ERROR] {item.Name}: all uninstall attempts failed.", true));
@@ -139,33 +131,44 @@ internal sealed class UninstallEngine
 
     private static async Task<bool> UninstallUwpAsync(PackageEntry item, IProgress<LogMessage> progress, CancellationToken ct)
     {
-        string packageFullName = item.UwpPackageFullName ?? string.Empty;
         string packageName = item.UwpPackageName ?? item.Name;
 
-        if (string.IsNullOrWhiteSpace(packageFullName))
+        if (string.IsNullOrWhiteSpace(packageName))
         {
-            progress.Report(new LogMessage($"[ERROR] {item.Name}: missing AppX full package name.", true));
+            progress.Report(new LogMessage($"[ERROR] {item.Name}: missing package name.", true));
             return false;
         }
 
-        string escapedFull = EscapePowerShellLiteral(packageFullName);
         string escapedName = EscapePowerShellLiteral(packageName);
 
         string command =
-            "$ErrorActionPreference='Stop'; " +
-            $"Remove-AppxPackage -AllUsers -Package '{escapedFull}'; " +
-            $"$prov = Get-AppxProvisionedPackage -Online | Where-Object {{ $_.DisplayName -eq '{escapedName}' }}; " +
-            "foreach($p in $prov){ Remove-AppxProvisionedPackage -Online -PackageName $p.PackageName -AllUsers | Out-Null }";
+            "$ErrorActionPreference='SilentlyContinue'; " +
+            $"$name='{escapedName}'; " +
+            "$removedAny=$false; " +
+            "Get-AppxPackage -AllUsers -Name $name | ForEach-Object { Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction SilentlyContinue; $removedAny=$true }; " +
+            "Get-AppxPackage -Name $name | ForEach-Object { Remove-AppxPackage -Package $_.PackageFullName -ErrorAction SilentlyContinue; $removedAny=$true }; " +
+            "$prov = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq $name -or $_.PackageName -like ($name + '*') }; " +
+            "foreach($p in $prov){ Remove-AppxProvisionedPackage -Online -PackageName $p.PackageName -AllUsers | Out-Null; $removedAny=$true }; " +
+            "$remaining = (Get-AppxPackage -AllUsers -Name $name | Measure-Object).Count + ((Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq $name -or $_.PackageName -like ($name + '*') } | Measure-Object).Count); " +
+            "if($remaining -eq 0){ exit 0 } elseif(-not $removedAny){ exit 3 } else { exit 2 }";
 
-        int code = await RunPowerShellAsync(command, ct);
-        if (code == 0)
+        ProcessResult result = await RunPowerShellDetailedAsync(command, ct);
+        if (result.ExitCode == 0)
         {
             CleanupResidualFiles(item, progress);
             progress.Report(new LogMessage($"[OK] {item.Name} UWP package removed and deprovisioned.", false));
             return true;
         }
 
-        progress.Report(new LogMessage($"[ERROR] {item.Name}: UWP removal failed with code {code}.", true));
+        string errorHint = result.ExitCode switch
+        {
+            2 => " Package is still present after removal attempt (possibly protected/non-removable).",
+            3 => " No matching package found for the current system context.",
+            _ => string.Empty
+        };
+
+        string details = BuildProcessErrorDetails(result);
+        progress.Report(new LogMessage($"[ERROR] {item.Name}: UWP removal failed with code {result.ExitCode}.{errorHint}{details}", true));
         return false;
     }
 
@@ -174,18 +177,18 @@ internal sealed class UninstallEngine
         string featureName = item.FeatureName ?? item.Name;
         string escapedFeature = EscapePowerShellLiteral(featureName);
 
-        string command =
-            "$ErrorActionPreference='Stop'; " +
-            $"Disable-WindowsOptionalFeature -Online -FeatureName '{escapedFeature}' -NoRestart";
+        string command = "$ErrorActionPreference='Stop'; " +
+                         $"Disable-WindowsOptionalFeature -Online -FeatureName '{escapedFeature}' -NoRestart";
 
-        int code = await RunPowerShellAsync(command, ct);
-        if (code == 0)
+        ProcessResult result = await RunPowerShellDetailedAsync(command, ct);
+        if (IsSuccessfulUninstallExitCode(result.ExitCode))
         {
             progress.Report(new LogMessage($"[OK] Feature disabled: {item.Name}", false));
             return true;
         }
 
-        progress.Report(new LogMessage($"[ERROR] Feature disable failed: {item.Name} (code {code})", true));
+        string details = BuildProcessErrorDetails(result);
+        progress.Report(new LogMessage($"[ERROR] Feature disable failed: {item.Name} (code {result.ExitCode}).{details}", true));
         return false;
     }
 
@@ -249,15 +252,15 @@ internal sealed class UninstallEngine
         return true;
     }
 
-    private static async Task<int> RunPowerShellAsync(string command, CancellationToken ct)
+    private static async Task<ProcessResult> RunPowerShellDetailedAsync(string command, CancellationToken ct)
     {
-        return await RunProcessAsync(
+        return await RunProcessDetailedAsync(
             "powershell.exe",
             $"-NoProfile -ExecutionPolicy Bypass -Command \"{command}\"",
             ct);
     }
 
-    private static async Task<int> RunProcessAsync(string fileName, string arguments, CancellationToken ct)
+    private static async Task<ProcessResult> RunProcessDetailedAsync(string fileName, string arguments, CancellationToken ct)
     {
         ProcessStartInfo psi = new()
         {
@@ -273,11 +276,14 @@ internal sealed class UninstallEngine
         using Process process = new() { StartInfo = psi };
         process.Start();
 
-        _ = process.StandardOutput.ReadToEndAsync(ct);
-        _ = process.StandardError.ReadToEndAsync(ct);
+        Task<string> stdOutTask = process.StandardOutput.ReadToEndAsync(ct);
+        Task<string> stdErrTask = process.StandardError.ReadToEndAsync(ct);
 
         await process.WaitForExitAsync(ct);
-        return process.ExitCode;
+        string stdOut = await stdOutTask;
+        string stdErr = await stdErrTask;
+
+        return new ProcessResult(process.ExitCode, stdOut, stdErr);
     }
 
     private static bool TryBuildMsiCommand(string uninstallString, out string exe, out string args)
@@ -345,6 +351,24 @@ internal sealed class UninstallEngine
 
             fileName = trimmed[1..endQuote];
             args = endQuote + 1 < trimmed.Length ? trimmed[(endQuote + 1)..].Trim() : string.Empty;
+            return true;
+        }
+
+        int exeIndex = trimmed.IndexOf(".exe", StringComparison.OrdinalIgnoreCase);
+        if (exeIndex > 0)
+        {
+            int pathEnd = exeIndex + 4;
+            fileName = trimmed[..pathEnd].Trim().Trim('"');
+            args = pathEnd < trimmed.Length ? trimmed[pathEnd..].Trim() : string.Empty;
+            return true;
+        }
+
+        int msiIndex = trimmed.IndexOf(".msi", StringComparison.OrdinalIgnoreCase);
+        if (msiIndex > 0)
+        {
+            int pathEnd = msiIndex + 4;
+            fileName = trimmed[..pathEnd].Trim().Trim('"');
+            args = pathEnd < trimmed.Length ? trimmed[pathEnd..].Trim() : string.Empty;
             return true;
         }
 
@@ -440,8 +464,7 @@ internal sealed class UninstallEngine
         }
 
         string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        string localLow = Path.Combine(localAppData, "Packages", packageFamily);
-        paths.Add(localLow);
+        paths.Add(Path.Combine(localAppData, "Packages", packageFamily));
 
         return paths;
     }
@@ -582,5 +605,27 @@ internal sealed class UninstallEngine
     private static string EscapePowerShellLiteral(string value)
     {
         return value.Replace("'", "''");
+    }
+
+    private static bool IsSuccessfulUninstallExitCode(int exitCode)
+    {
+        return exitCode is 0 or 1641 or 3010;
+    }
+
+    private static string BuildProcessErrorDetails(ProcessResult result)
+    {
+        string source = string.IsNullOrWhiteSpace(result.StdErr) ? result.StdOut : result.StdErr;
+        if (string.IsNullOrWhiteSpace(source))
+        {
+            return string.Empty;
+        }
+
+        string compact = source.Replace(Environment.NewLine, " ").Trim();
+        if (compact.Length > 220)
+        {
+            compact = compact[..220] + "...";
+        }
+
+        return $" Details: {compact}";
     }
 }

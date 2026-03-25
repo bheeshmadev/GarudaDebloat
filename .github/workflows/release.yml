@@ -30,8 +30,8 @@ jobs:
       - name: Archive release files
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}"
-          $zipName = "GarudaDebloat-$version-win-x64-selfcontained.zip"
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          $zipName = "Garuda Debloat V$version.zip"
           Compress-Archive -Path "release/win-x64/*" -DestinationPath "release/$zipName" -Force
           Get-FileHash "release/$zipName" -Algorithm SHA256 | ForEach-Object {
             "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf)
